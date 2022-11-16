@@ -1,6 +1,9 @@
+import math
+
 import torch
 import tqdm
 from sklearn.metrics import roc_auc_score
+from torch.optim.lr_scheduler import OneCycleLR
 from torch.utils.data import DataLoader
 
 from torchfm.dataset.avazu import AvazuDataset
@@ -79,13 +82,32 @@ def get_model(name, dataset):
         return AttentionalFactorizationMachineModel(field_dims, embed_dim=16, attn_size=16, dropouts=(0.2, 0.2))
     elif name == 'afi':
         return AutomaticFeatureInteractionModel(
-             field_dims, embed_dim=16, atten_embed_dim=64, num_heads=2, num_layers=3, mlp_dims=(400, 400), dropouts=(0, 0, 0))
+            field_dims, embed_dim=16, atten_embed_dim=64, num_heads=2, num_layers=3, mlp_dims=(400, 400),
+            dropouts=(0, 0, 0))
     elif name == 'afn':
         print("Model:AFN")
         return AdaptiveFactorizationNetwork(
             field_dims, embed_dim=16, LNN_dim=1500, mlp_dims=(400, 400, 400), dropouts=(0, 0, 0))
     else:
         raise ValueError('unknown model name: ' + name)
+
+
+def save_train_metrics(
+        metrics_dict,
+        train_loss,
+        train_error,
+):
+    metrics_dict["train_loss"].append(train_loss)
+    metrics_dict["train_error"].append(train_error)
+
+
+def save_generalization_metrics(
+        metrics_dict,
+        generalization_loss,
+        generalization_error
+):
+    metrics_dict["generalization_loss"].append(generalization_loss)
+    metrics_dict["generalization_error"].append(generalization_error)
 
 
 class EarlyStopper(object):
@@ -109,9 +131,23 @@ class EarlyStopper(object):
             return False
 
 
-def train(model, optimizer, data_loader, criterion, device, log_interval=100):
+def train(
+        model,
+        optimizer,
+        lr_scheduler,
+        data_loader,
+        criterion,
+        device,
+        metric_save_steps: int,
+        train_step: int,
+        metrics_dict: dict,
+        log_interval=100
+):
     model.train()
     total_loss = 0
+    train_loss = 0
+    correct = 0
+    total = 0
     tk0 = tqdm.tqdm(data_loader, smoothing=0, mininterval=1.0)
     for i, (fields, target) in enumerate(tk0):
         fields, target = fields.to(device), target.to(device)
@@ -120,10 +156,25 @@ def train(model, optimizer, data_loader, criterion, device, log_interval=100):
         model.zero_grad()
         loss.backward()
         optimizer.step()
+        lr_scheduler.step()
         total_loss += loss.item()
+        train_loss += loss.item()
         if (i + 1) % log_interval == 0:
             tk0.set_postfix(loss=total_loss / log_interval)
-            total_loss = 0
+            total_loss = 0  # Do we want to reset total_loss here?
+
+        predicted = torch.round(y)
+        total += target.size(0)
+        correct += predicted.eq(target).sum().item()
+
+        if train_step % metric_save_steps == 0:
+            #p rint(f"Train Loss: {(loss / (i + 1)).item()}")
+            save_train_metrics(metrics_dict=metrics_dict, train_loss=(loss / (i + 1)).item(), train_error=1 - (correct / total))
+            # print(metrics_dict)
+
+        train_step += 1
+
+    return train_step
 
 
 def test(model, data_loader, device):
@@ -143,10 +194,23 @@ def main(dataset_name,
          model_name,
          epoch,
          learning_rate,
+         warmup,
+         decay,
          batch_size,
          weight_decay,
+         metric_save_steps,
          device,
          save_dir):
+
+    global_step = 0
+
+    metrics = {
+        "train_loss": [],
+        "train_error": [],
+        "generalization_loss": [],
+        "generalization_error": []
+    }
+
     device = torch.device(device)
     dataset = get_dataset(dataset_name, dataset_path)
     train_length = int(len(dataset) * 0.8)
@@ -160,9 +224,35 @@ def main(dataset_name,
     model = get_model(model_name, dataset).to(device)
     criterion = torch.nn.BCELoss()
     optimizer = torch.optim.Adam(params=model.parameters(), lr=learning_rate, weight_decay=weight_decay)
+
+    if warmup is None:
+        warmup = 0.0
+        div_factor = 1.0
+    else:
+        warmup = warmup
+        div_factor = 100.0
+
+    if decay is None:
+        final_div_factor = 1.0
+    else:
+        final_div_factor = 100.0
+
+    total_steps = int(len(train_data_loader) * epoch)
+
+    lr_scheduler = OneCycleLR(
+        optimizer=optimizer,
+        max_lr=learning_rate,
+        total_steps=total_steps,
+        pct_start=warmup,
+        anneal_strategy='linear',
+        div_factor=div_factor,
+        final_div_factor=final_div_factor
+    )
+
     early_stopper = EarlyStopper(num_trials=2, save_path=f'{save_dir}/{model_name}.pt')
     for epoch_i in range(epoch):
-        train(model, optimizer, train_data_loader, criterion, device)
+        global_step = train(model, optimizer, lr_scheduler, train_data_loader, criterion, device, metric_save_steps, global_step, metrics)
+        # print(f"Step: {global_step}")
         auc = test(model, valid_data_loader, device)
         print('epoch:', epoch_i, 'validation: auc:', auc)
         if not early_stopper.is_continuable(model, auc):
@@ -181,17 +271,24 @@ if __name__ == '__main__':
     parser.add_argument('--model_name', default='afi')
     parser.add_argument('--epoch', type=int, default=100)
     parser.add_argument('--learning_rate', type=float, default=0.001)
+    parser.add_argument('--warmup', type=float, default=None)
+    parser.add_argument('--decay', type=float, default=None)
     parser.add_argument('--batch_size', type=int, default=2048)
     parser.add_argument('--weight_decay', type=float, default=1e-6)
+    parser.add_argument('--metric_save_steps', type=int, default=50)
     parser.add_argument('--device', default='cuda:0')
     parser.add_argument('--save_dir', default='chkpt')
     args = parser.parse_args()
+
     main(args.dataset_name,
          args.dataset_path,
          args.model_name,
          args.epoch,
          args.learning_rate,
+         args.warmup,
+         args.decay,
          args.batch_size,
          args.weight_decay,
+         args.metric_save_steps,
          args.device,
          args.save_dir)
