@@ -1,4 +1,5 @@
 import math
+# Check the train step against the logger steps to determine whether or not to save the model
 
 import torch
 import tqdm
@@ -25,12 +26,6 @@ from torchfm.model.pnn import ProductNeuralNetworkModel
 from torchfm.model.wd import WideAndDeepModel
 from torchfm.model.xdfm import ExtremeDeepFactorizationMachineModel
 from torchfm.model.afn import AdaptiveFactorizationNetwork
-
-
-"""
-* Initial file that was worked on for explicit metrics logging, deprecated
-* when we switched over to logging the entire model every k steps
-"""
 
 
 def get_dataset(name, path):
@@ -98,24 +93,6 @@ def get_model(name, dataset):
         raise ValueError('unknown model name: ' + name)
 
 
-def save_train_metrics(
-        metrics_dict,
-        train_loss,
-        train_error,
-):
-    metrics_dict["train_loss"].append(train_loss)
-    metrics_dict["train_error"].append(train_error)
-
-
-def save_generalization_metrics(
-        metrics_dict,
-        generalization_loss,
-        generalization_error
-):
-    metrics_dict["generalization_loss"].append(generalization_loss)
-    metrics_dict["generalization_error"].append(generalization_error)
-
-
 def save_metrics(
         metrics_dict,
         train_loss,
@@ -127,6 +104,34 @@ def save_metrics(
     metrics_dict["train_error"].append(train_error)
     metrics_dict["generalization_loss"].append(generalization_loss)
     metrics_dict["generalization_error"].append(generalization_error)
+
+
+"""
+* Get a per-step schedule for saving the model
+*
+* @param initial_steps: the first steps to log per mini-batch
+* @param post_interval: log every k steps after initial_steps
+* @param total_steps: total steps in the pipeline
+"""
+
+
+def get_log_schedule(
+        initial_steps,
+        post_interval,
+        total_steps,
+):
+    # If we use 50, we will get logs for steps 0 -> 50, technically 51 steps
+    intervals = list(range(initial_steps))
+    end_intervals = list(range(initial_steps, total_steps, post_interval))
+
+    intervals.extend(end_intervals)
+
+    log_schedule = [0] * total_steps
+
+    for step in intervals:
+        log_schedule[step] = 1
+
+    return log_schedule
 
 
 class EarlyStopper(object):
@@ -149,11 +154,28 @@ class EarlyStopper(object):
         else:
             return False
 
-def get_generalization_metrics():
-    generalization_loss = 1
-    generalization_error = 0
+
+def generalization_metrics(model, data_loader, device, criterion):
+    model.eval()
+
+    generalization_loss = 0
+    correct = 0
+    total = 0
+
+    with torch.no_grad():
+        for fields, targets in tqdm.tqdm(data_loader, smoothing=0, mininterval=1.0):
+            fields, targets = fields.to(device), targets.to(device)
+            outputs = model(fields)
+            loss = criterion(outputs, targets).mean()
+            generalization_loss += loss.item()
+            predicted = torch.round(outputs)
+            total += targets.size(0)
+            correct += predicted.eq(targets).sum().item()
+
+    generalization_error = 1 - (correct / total)
 
     return generalization_loss, generalization_error
+
 
 def train_single_step(
         model,
@@ -161,13 +183,15 @@ def train_single_step(
         inputs,
         targets,
         criterion,
-        lr_scheduler
+        learning_rate,
 ):
     outputs = model(inputs)
     loss = criterion(outputs, targets)
     loss.backward()
     optimizer.step()
-    lr_scheduler.step()
+
+    if type(learning_rate) != float:
+        learning_rate.step()
 
     return outputs, loss
 
@@ -175,14 +199,13 @@ def train_single_step(
 def train_single_epoch(
         model,
         optimizer,
-        trainloader,
-        epoch_num,
-        train_step,
-        metrics_dict,
-        metric_save_steps,
+        train_loader,
         device,
         criterion,
-        lr_scheduler,
+        learning_rate,
+        log_schedule,
+        train_step,
+        logging_path
 ):
     model.train()
     train_loss = 0
@@ -191,78 +214,30 @@ def train_single_epoch(
 
     optimizer.zero_grad()
 
-    for batch_idx, (inputs, targets) in enumerate(trainloader):
+    for batch_idx, (inputs, targets) in enumerate(train_loader):
         inputs, targets = inputs.to(device), targets.to(device)
 
         outputs, loss = train_single_step(model=model, optimizer=optimizer, inputs=inputs, targets=targets,
-                                          criterion=criterion, lr_scheduler=lr_scheduler)
+                                          criterion=criterion, learning_rate=learning_rate)
+
+        if log_schedule[train_step] == 1:
+            print(f'Logging @ Step: {train_step}')
+            torch.save({
+                'step': train_step,
+                'model_state_dict': model.state_dict(),
+                'optimizer_state_dict': optimizer.state_dict()
+            }, f'{logging_path}_step_{train_step}.pt')
+
+        train_step += 1
 
         train_loss += loss.item()
         predicted = torch.round(outputs)
         total += targets.size(0)
         correct += predicted.eq(targets).sum().item()
 
-        if train_step % metric_save_steps == 0:
-            generalization_loss, generalization_error = get_generalization_metrics()
+    train_error = 1 - (correct / total)
 
-            save_metrics(
-                metrics_dict=metrics_dict,
-                train_loss=train_loss / (batch_idx + 1),
-                train_error = 1 - (correct / total),
-                generalization_loss=generalization_loss,
-                generalization_error=generalization_error
-            )
-
-        train_step += 1
-
-    return train_step
-
-
-def train(
-        model,
-        optimizer,
-        lr_scheduler,
-        data_loader,
-        criterion,
-        device,
-        metric_save_steps: int,
-        train_step: int,
-        metrics_dict: dict,
-        log_interval=100
-):
-    model.train()
-    total_loss = 0
-    train_loss = 0
-    correct = 0
-    total = 0
-    tk0 = tqdm.tqdm(data_loader, smoothing=0, mininterval=1.0)
-    for i, (fields, target) in enumerate(tk0):
-        fields, target = fields.to(device), target.to(device)
-        y = model(fields)
-        loss = criterion(y, target.float())
-        model.zero_grad()
-        loss.backward()
-        optimizer.step()
-        lr_scheduler.step()
-        total_loss += loss.item()
-        train_loss += loss.item()
-        if (i + 1) % log_interval == 0:
-            tk0.set_postfix(loss=total_loss / log_interval)
-            total_loss = 0  # Do we want to reset total_loss here?
-
-        predicted = torch.round(y)
-        total += target.size(0)
-        correct += predicted.eq(target).sum().item()
-
-        if train_step % metric_save_steps == 0:
-            # print(f"Train Loss: {(loss / (i + 1)).item()}")
-            save_train_metrics(metrics_dict=metrics_dict, train_loss=(loss / (i + 1)).item(),
-                               train_error=1 - (correct / total))
-            # print(metrics_dict)
-
-        train_step += 1
-
-    return train_step
+    return train_loss, train_error, train_step
 
 
 def test(model, data_loader, device):
@@ -282,22 +257,14 @@ def main(dataset_name,
          model_name,
          epoch,
          learning_rate,
-         warmup,
+         warmup_fraction,
          decay,
          batch_size,
          weight_decay,
-         metric_save_steps,
+         initial_log_steps,
+         log_k_steps,
          device,
          save_dir):
-    global_step = 0
-
-    metrics = {
-        "train_loss": [],
-        "train_error": [],
-        "generalization_loss": [],
-        "generalization_error": []
-    }
-
     device = torch.device(device)
     dataset = get_dataset(dataset_name, dataset_path)
     train_length = int(len(dataset) * 0.8)
@@ -312,35 +279,58 @@ def main(dataset_name,
     criterion = torch.nn.BCELoss()
     optimizer = torch.optim.Adam(params=model.parameters(), lr=learning_rate, weight_decay=weight_decay)
 
-    if warmup is None:
-        warmup = 0.0
-        div_factor = 1.0
-    else:
-        warmup = warmup
-        div_factor = 100.0
-
-    if decay is None:
-        final_div_factor = 1.0
-    else:
-        final_div_factor = 100.0
+    train_step = 0
 
     total_steps = int(len(train_data_loader) * epoch)
 
-    lr_scheduler = OneCycleLR(
-        optimizer=optimizer,
-        max_lr=learning_rate,
-        total_steps=total_steps,
-        pct_start=warmup,
-        anneal_strategy='linear',
-        div_factor=div_factor,
-        final_div_factor=final_div_factor
+    log_schedule = get_log_schedule(
+        initial_steps=initial_log_steps,
+        post_interval=log_k_steps,
+        total_steps=total_steps
     )
 
-    early_stopper = EarlyStopper(num_trials=2, save_path=f'{save_dir}/{model_name}.pt')
+    if warmup_fraction is not None or decay is True:
+
+        if warmup_fraction is None:
+            warmup_fraction = 0.0
+            div_factor = 1.0
+        else:
+            warmup_fraction = warmup_fraction
+            div_factor = 100.0
+
+        if decay is False:
+            final_div_factor = 1.0
+        else:
+            final_div_factor = 10.0
+
+        learning_rate = OneCycleLR(
+            optimizer=optimizer,
+            max_lr=learning_rate,
+            total_steps=total_steps,
+            pct_start=warmup_fraction,
+            anneal_strategy='linear',
+            div_factor=div_factor,
+            final_div_factor=final_div_factor
+        )
+    else:
+        learning_rate = learning_rate
+
+    print(learning_rate)
+
+    logging_path = f'logging/{dataset_name}/{model_name}'
+
+    # Do we still want to have this early stopper save?
+    early_stopper = EarlyStopper(num_trials=2, save_path=f'{save_dir}/{model_name}_early_stopper.pt')
     for epoch_i in range(epoch):
-        global_step = train(model, optimizer, lr_scheduler, train_data_loader, criterion, device, metric_save_steps,
-                            global_step, metrics)
+        train_loss, train_error, train_step = train_single_epoch(model=model, optimizer=optimizer,
+                                                                 train_loader=train_data_loader,
+                                                                 device=device, criterion=criterion,
+                                                                 learning_rate=learning_rate,
+                                                                 log_schedule=log_schedule,
+                                                                 train_step=train_step,
+                                                                 logging_path=logging_path)
         # print(f"Step: {global_step}")
+
         auc = test(model, valid_data_loader, device)
         print('epoch:', epoch_i, 'validation: auc:', auc)
         if not early_stopper.is_continuable(model, auc):
@@ -359,11 +349,12 @@ if __name__ == '__main__':
     parser.add_argument('--model_name', default='afi')
     parser.add_argument('--epoch', type=int, default=100)
     parser.add_argument('--learning_rate', type=float, default=0.001)
-    parser.add_argument('--warmup', type=float, default=None)
-    parser.add_argument('--decay', type=float, default=None)
+    parser.add_argument('--warmup_fraction', type=float, default=None)
+    parser.add_argument('--decay', type=bool, default=False)
     parser.add_argument('--batch_size', type=int, default=2048)
     parser.add_argument('--weight_decay', type=float, default=1e-6)
-    parser.add_argument('--metric_save_steps', type=int, default=50)
+    parser.add_argument('--initial_log_steps', type=int, default=50)
+    parser.add_argument('--log_k_steps', type=int, default=50)
     parser.add_argument('--device', default='cuda:0')
     parser.add_argument('--save_dir', default='chkpt')
     args = parser.parse_args()
@@ -373,10 +364,11 @@ if __name__ == '__main__':
          args.model_name,
          args.epoch,
          args.learning_rate,
-         args.warmup,
+         args.warmup_fraction,
          args.decay,
          args.batch_size,
          args.weight_decay,
-         args.metric_save_steps,
+         args.initial_log_steps,
+         args.log_k_steps,
          args.device,
          args.save_dir)
